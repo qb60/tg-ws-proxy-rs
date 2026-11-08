@@ -71,7 +71,7 @@ Start with one LAN computer and keep the old working route available for rollbac
    Do not include the router's own addresses. This source restriction is important:
    locally generated WSS and TCP-fallback connections must not re-enter this section.
 3. Match Telegram **DC IP traffic**, not every Telegram website/domain. The listener
-   is not an HTTP proxy and cannot forward `t.me` or Telegram Web HTTPS. For a TCP-only
+   routes Telegram DC IPs as MTProto; website hostnames use TCP passthrough instead. For a TCP-only
    match, use a custom source rule set such as the example below. In Forkop's rule-set
    settings enable subnet/IP matching (custom rule-set subnets may be ignored by default).
 4. Make this section take precedence over existing routes matching the same client
@@ -135,24 +135,26 @@ An address missing from both maps is handled by where it is:
   the first one is logged at info level with the `--socks-dc` line that pins it.
   A plain transport names no DC, and Android without a proxy secret fills those bytes
   randomly, so such connections are closed with a warning that media will not load.
-- **Outside them**: refused (`not a Telegram address`), with no generic direct proxy
-  fallback. That is a routing rule sending the wrong traffic here.
+- **Outside them**: forwarded as plain TCP to the requested address and port,
+  through the shared outbound connector (`--outbound-proxy` and `NO_PROXY` apply).
+  SOCKS domain names use the same TCP path; they are not mapped to Telegram DCs.
 
-Each outcome is logged once per address; repeated rejections go to debug level,
+Telegram DC lookup outcomes are logged once per address; repeated failures go to debug level,
 since Telegram retries a refused DC every few seconds. A successful header lookup
 does not hide a later warning for a client that cannot name the DC.
 
 Supported: SOCKS5 no-auth CONNECT, IPv4/IPv6 addresses (including IP literals encoded
-as SOCKS DOMAIN) on any destination port, MTProto abridged/intermediate/padded
+as SOCKS DOMAIN), arbitrary hostnames via TCP passthrough, MTProto abridged/intermediate/padded
 intermediate, with or without secretless transport obfuscation. The port does not
-matter: the bridge reaches the DC over its own routes. MTProto content
+matter for Telegram: the bridge reaches the DC over its own routes. MTProto content
 remains encrypted end-to-end; transport obfuscation is not message encryption.
 
-Not supported: SOCKS UDP ASSOCIATE/BIND, arbitrary DNS names/web browsing,
+Not supported: SOCKS UDP ASSOCIATE/BIND,
 MTProto Full/HTTP transport, inbound FakeTLS or MTProxy-secret traffic on the SOCKS
 port. Calls are not provided by this TCP bridge.
 
-SOCKS CONNECT is acknowledged after destination validation, before MTProto/WSS
+For TCP passthrough, SOCKS CONNECT is acknowledged only after the outbound
+connection succeeds. For Telegram, it is acknowledged before MTProto/WSS
 negotiation, because Telegram waits for that acknowledgement before sending its
 transport header. A subsequent upstream failure closes the tunnel. A successful
 SOCKS reply alone therefore does not prove that Telegram or WSS works.
@@ -165,15 +167,11 @@ SOCKS reply alone therefore does not prove that Telegram or WSS works.
 - `missing from the DC map, and its transport names no DC`: add the address with
   `--socks-dc` (negative DC for media). `routing it as DCn by its transport header` is
   informational; pinning it with the suggested line is optional.
-- `not a Telegram address`: a routing rule sends non-Telegram traffic here; check the
-  **real destination IP** and the rule set. Each address is logged once; enable debug
-  logs to see every attempt.
 - `unsupported MTProto transport`: enable debug logs; confirm the app proxy is off
   and that the traffic is native MTProto, not HTTPS/MTProxy or a call.
 - Connection storm/zero data: inspect the device filter and outbound exclusions for
   a routing loop; disable the Forkop test section first.
-- Latency checks aimed at a generic HTTP URL are not meaningful for this Telegram-only
-  SOCKS service. Test with Telegram, not `curl https://example.com` through the proxy.
+- HTTP checks exercise TCP passthrough only. Test with Telegram to verify WSS routing.
 
 To roll back, first disable `telegram_ws` / restore the previous Telegram route,
 then turn off **SOCKS5 input** and restart the service. Existing MTProto proxy clients

@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf as TcpReader, OwnedWriteHalf as TcpWriter};
 use tracing::debug;
 
-use super::{ClientReader, ClientWriter, Inbound, Link, PendingData, Reject, Session};
+use super::{Accepted, ClientReader, ClientWriter, Inbound, Link, PendingData, Reject, Session};
 use crate::config::Config;
 use crate::crypto::{build_client_ciphers, parse_handshake};
 use crate::faketls::{
@@ -31,7 +31,7 @@ impl Inbound for MtProto {
         stream: TcpStream,
         peer: SocketAddr,
         config: &Config,
-    ) -> Result<Session, Reject> {
+    ) -> Result<Accepted, Reject> {
         let label = peer;
         let secrets = config.normalized_secrets();
         let faketls_domain = config.normalized_listen_faketls_domain();
@@ -68,13 +68,13 @@ impl Inbound for MtProto {
             return Err(Reject::Close);
         };
         let dc_idx = if info.is_media { -dc } else { dc };
-        Ok(Session {
+        Ok(Accepted::Telegram(Session {
             reader,
             writer,
             dc_idx,
             proto: info.proto,
             obfuscation: Some(build_client_ciphers(&info.prekey_and_iv, secret)),
-        })
+        }))
     }
 
     /// One `tg://proxy` link per secret, the primary one first.

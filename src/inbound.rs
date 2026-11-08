@@ -1,9 +1,10 @@
-//! The inbound layer: every listener protocol reduces a client to a
-//! [`Session`], and everything after that is shared.
+//! The inbound layer: every listener protocol reduces a client to an
+//! [`Accepted`] connection, and everything after that is shared.
 //!
 //! An inbound owns only its handshake — MTProto's secret check and FakeTLS
 //! camouflage, SOCKS5's destination lookup — up to the point where the DC,
-//! the transport framing and the client's obfuscation, if any, are known.
+//! the transport framing and the client's obfuscation, if any, are known,
+//! or a non-Telegram TCP destination is known.
 //! [`serve`] bounds every handshake with the same timeout; `proxy` then
 //! builds the relay init and Telegram-side ciphers once and runs the routing
 //! ladder and bridges, none of which know which listener a client came in on.
@@ -52,6 +53,13 @@ pub(crate) struct Session {
     pub(crate) obfuscation: Option<(AesCtr256, AesCtr256)>,
 }
 
+// The session ciphers are consumed by the routing ladder, not held by the relay.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Accepted {
+    Telegram(Session),
+    Tcp(socks::PendingConnect),
+}
+
 /// A way for a client to reach a listener, as offered to the user to copy.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Link {
@@ -86,7 +94,7 @@ pub(crate) trait Inbound: Send + Sync + 'static {
         stream: TcpStream,
         peer: SocketAddr,
         config: &Config,
-    ) -> impl Future<Output = Result<Session, Reject>> + Send;
+    ) -> impl Future<Output = Result<Accepted, Reject>> + Send;
 
     /// The links a user copies into a client to reach this listener at
     /// `addr`.
@@ -106,7 +114,8 @@ pub(crate) async fn serve<I: Inbound>(
     let timeout = Duration::from_secs(config.handshake_timeout);
     // No arm awaits: the handshake's result, ciphers included, stays a
     // temporary of this statement instead of part of the session's state.
-    let rest = match tokio::time::timeout(timeout, inbound.handshake(stream, peer, &config)).await {
+    let handshake = inbound.handshake(stream, peer, &config);
+    let rest = match tokio::time::timeout(timeout, handshake).await {
         Ok(Ok(session)) => Either::Left(proxy::serve_session(peer, session, config, pool, runtime)),
         Ok(Err(Reject::Drain(reader, writer))) => Either::Right(async move {
             let _writer = writer;

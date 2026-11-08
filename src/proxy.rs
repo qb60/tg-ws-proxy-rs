@@ -6,8 +6,8 @@
 //!  Telegram client
 //!       │  MTProto (port 1443) or SOCKS5
 //!       ▼
-//!  [inbound::serve]   ← the listener's handshake yields a Session:
-//!       │                DC, framing, client obfuscation
+//!  [inbound::serve]   ← the listener's handshake yields a destination:
+//!       │                DC, framing, client obfuscation, or a plain TCP target
 //!       ▼
 //!  [select_upstream]  ← the fallback ladder: pooled/direct WebSocket,
 //!       │                Cloudflare Worker, Cloudflare proxy (H2/WS), upstream
@@ -48,7 +48,7 @@ use crate::faketls::{
     drain_faketls_server_hello, read_tls_appdata, sign_faketls_client_hello, write_tls_appdata,
 };
 use crate::inbound::mtproto::MtProto;
-use crate::inbound::{self, CLIENT_READ_BUF_SIZE, ClientReader, ClientWriter, Session};
+use crate::inbound::{self, Accepted, CLIENT_READ_BUF_SIZE, ClientReader, ClientWriter};
 use crate::outbound::OutboundConnector;
 use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
@@ -322,7 +322,7 @@ pub async fn handle_client_with_runtime(
 /// Route and bridge a client whose inbound handshake is done.
 pub(crate) fn serve_session(
     label: SocketAddr,
-    session: Session,
+    session: Accepted,
     config: Arc<Config>,
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
@@ -346,11 +346,40 @@ pub(crate) fn serve_session(
 
 async fn select_bridge(
     label: SocketAddr,
-    session: Session,
+    session: Accepted,
     config: Arc<Config>,
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
 ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+    let session = match session {
+        Accepted::Telegram(session) => session,
+        Accepted::Tcp(pending) => {
+            let result = runtime
+                .outbound()
+                .connect(
+                    &pending.host,
+                    pending.port,
+                    Duration::from_secs(config.handshake_timeout),
+                )
+                .await
+                .map_err(std::io::Error::other);
+            let (mut client, mut upstream) = match pending.complete(result).await {
+                Ok(streams) => streams,
+                Err(error) => {
+                    debug!("[{}] SOCKS TCP connect: {}", label, error);
+                    return None;
+                }
+            };
+            return Some(Box::pin(async move {
+                if let Err(error) =
+                    tokio::io::copy_bidirectional_with_sizes(&mut client, &mut upstream, 1024, 1024)
+                        .await
+                {
+                    debug!("[{}] SOCKS TCP relay: {}", label, error);
+                }
+            }));
+        }
+    };
     let dc_id = u32::from(session.dc_idx.unsigned_abs());
     let is_media = session.dc_idx < 0;
     debug!(

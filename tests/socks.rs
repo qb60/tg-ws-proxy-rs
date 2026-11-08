@@ -78,7 +78,7 @@ async fn request(client: &mut TcpStream, ip: IpAddr, port: u16, cmd: u8) -> u8 {
 }
 
 #[tokio::test]
-async fn accepts_mapped_ips_and_rejects_auth_udp_bind_unknown_and_domains() {
+async fn accepts_mapped_ips_and_rejects_auth_udp_bind_and_invalid_domains() {
     let (mut client, task) = start(config()).await;
     client.write_all(&[5, 1, 2]).await.unwrap();
     assert_eq!(read::<2>(&mut client).await, [5, 255]);
@@ -86,8 +86,6 @@ async fn accepts_mapped_ips_and_rejects_auth_udp_bind_unknown_and_domains() {
     for (ip, port, cmd, code) in [
         ("149.154.167.51", 443, 2, 7),
         ("149.154.167.51", 443, 3, 7),
-        ("127.0.0.1", 443, 1, 2),
-        ("198.18.0.20", 443, 1, 2),
         // Built into the official clients, so no --socks-dc is needed.
         ("2001:67c:4e8:f002::a", 443, 1, 0),
         // From a dual-stack socket: still the IPv4 DC2 address.
@@ -105,15 +103,119 @@ async fn accepts_mapped_ips_and_rejects_auth_udp_bind_unknown_and_domains() {
         drop(client);
         task.await.unwrap();
     }
+    for host in ["", "bad\r\nhost", "bad host", "bad\0host"] {
+        let (mut client, task) = start(config()).await;
+        greet(&mut client).await;
+        assert_eq!(domain_request(&mut client, host, 443).await, 4);
+        assert_closed_cleanly(&mut client).await;
+        task.await.unwrap();
+    }
     let (mut client, task) = start(config()).await;
     greet(&mut client).await;
-    client
-        .write_all(b"\x05\x01\x00\x03\x0bexample.com\x01\xbb")
+    assert_eq!(domain_request(&mut client, "149.154.167.51", 443).await, 0);
+    drop(client);
+    task.await.unwrap();
+}
+
+async fn domain_request(client: &mut TcpStream, host: &str, port: u16) -> u8 {
+    let mut packet = vec![5, 1, 0, 3, host.len() as u8];
+    packet.extend_from_slice(host.as_bytes());
+    packet.extend_from_slice(&port.to_be_bytes());
+    client.write_all(&packet).await.unwrap();
+    read::<10>(client).await[1]
+}
+
+#[tokio::test]
+async fn non_telegram_tcp_bypasses_ws_and_honors_outbound_proxy_and_no_proxy() {
+    for mode in [
+        "ipv4",
+        "ipv6",
+        "domain",
+        "outbound",
+        "no_proxy",
+        "mapped_ipv4",
+    ] {
+        let listener = TcpListener::bind(if mode == "ipv6" {
+            "[::1]:0"
+        } else {
+            "127.0.0.1:0"
+        })
         .await
         .unwrap();
-    assert_eq!(read::<10>(&mut client).await[1], 4);
+        let target = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"ready").await.unwrap();
+            let mut payload = Vec::new();
+            socket.read_to_end(&mut payload).await.unwrap();
+            assert_eq!(payload, vec![42; 4096]);
+            socket.write_all(&payload).await.unwrap();
+        });
+        let mut cfg = config();
+        let mut proxy_task = None;
+        if mode == "outbound" {
+            let (proxy, task) = common::tunneling_http_proxy(target).await;
+            cfg.outbound_proxy = Some(format!("http://{proxy}"));
+            proxy_task = Some(task);
+        } else if mode == "no_proxy" {
+            cfg.outbound_proxy = Some("http://127.0.0.1:1".into());
+            cfg.no_proxy = Some("localhost".into());
+        }
+        let (mut client, task) = start(cfg).await;
+        greet(&mut client).await;
+        let code = match mode {
+            "domain" | "no_proxy" => domain_request(&mut client, "localhost", target.port()).await,
+            "outbound" => domain_request(&mut client, "example.test", 8443).await,
+            "mapped_ipv4" => {
+                request(
+                    &mut client,
+                    "::ffff:127.0.0.1".parse().unwrap(),
+                    target.port(),
+                    1,
+                )
+                .await
+            }
+            _ => request(&mut client, target.ip(), target.port(), 1).await,
+        };
+        assert_eq!(code, 0, "mode {mode}");
+        assert_eq!(&read::<5>(&mut client).await, b"ready");
+        if mode == "ipv4" {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        }
+        client.write_all(&vec![42; 4096]).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(read::<4096>(&mut client).await, [42; 4096]);
+        assert_closed_cleanly(&mut client).await;
+        common::await_proxy_handler(task).await;
+        common::await_unit_task(server).await;
+        if let Some(task) = proxy_task {
+            assert!(
+                common::await_proxy_request(task)
+                    .await
+                    .starts_with("CONNECT example.test:8443 ")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_telegram_connect_failure_returns_socks_error() {
+    let (proxy, task) = common::rejecting_http_proxy().await;
+    let mut cfg = config();
+    cfg.outbound_proxy = Some(format!("http://{proxy}"));
+    let (mut client, handler) = start(cfg).await;
+    greet(&mut client).await;
+    assert_eq!(
+        request(&mut client, "198.18.0.20".parse().unwrap(), 8080, 1).await,
+        1
+    );
     assert_closed_cleanly(&mut client).await;
-    task.await.unwrap();
+    common::await_proxy_handler(handler).await;
+    assert!(
+        common::await_proxy_request(task)
+            .await
+            .starts_with("CONNECT 198.18.0.20:8080 ")
+    );
 }
 
 /// After an error reply the listener must close with FIN: closing with

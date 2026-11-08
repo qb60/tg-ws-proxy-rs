@@ -195,7 +195,7 @@ pub struct Config {
     #[arg(long, env = "TG_HOST")]
     pub host: Option<String>,
 
-    /// Enable a separate, unauthenticated Telegram-only SOCKS5 listener.
+    /// Enable a separate, unauthenticated SOCKS5 listener with Telegram routing.
     #[arg(long, env = "TG_SOCKS_ENABLED")]
     pub socks_enabled: bool,
 

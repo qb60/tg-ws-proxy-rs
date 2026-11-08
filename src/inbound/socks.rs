@@ -1,12 +1,12 @@
-//! A Telegram-only SOCKS5 entrance to the existing MTProto/WSS bridge.
+//! A SOCKS5 entrance to the MTProto/WSS bridge with TCP passthrough.
 //!
 //! SOCKS carries the destination separately from MTProto. Unlike MTProxy,
 //! ordinary clients do not hash their obfuscation key with a proxy secret;
 //! un-obfuscated transports do not carry a DC at all. Resolve the destination
 //! using an explicit DC map — or, for a Telegram address the map has not
 //! caught up with, the DC an obfuscated header names — then normalize either
-//! transport for the shared upstream ladder. Never silently send an unknown
-//! destination over raw TCP.
+//! transport for the shared upstream ladder. Non-Telegram destinations bypass
+//! that ladder through the shared outbound connector.
 
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind};
@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use super::{ClientReader, ClientWriter, Inbound, Link, Reject, Session};
+use super::{Accepted, ClientReader, ClientWriter, Inbound, Link, Reject, Session};
 use crate::config::Config;
 use crate::crypto::{AesCtr256, ProtoTag, apply_keystream, build_raw_ciphers, make_cipher};
 use crate::inbound;
@@ -172,7 +172,6 @@ fn destination_dc(ip: IpAddr, config: &Config) -> Option<i16> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReportKind {
-    NotTelegram,
     HeaderDc,
     MissingDc,
 }
@@ -205,10 +204,32 @@ async fn reply(stream: &mut TcpStream, code: u8) -> io::Result<()> {
     stream.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await
 }
 
-/// Answer the SOCKS request, returning the destination and the DC the map
-/// knows it as. An unmapped Telegram address is accepted with `None`: its DC
-/// can only come from the transport header that follows.
-async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<(IpAddr, Option<i16>)> {
+/// CONNECT must wait for the outbound result before acknowledging the client.
+pub(crate) struct PendingConnect {
+    stream: TcpStream,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
+impl PendingConnect {
+    pub(crate) async fn complete(
+        mut self,
+        result: io::Result<TcpStream>,
+    ) -> io::Result<(TcpStream, TcpStream)> {
+        let upstream = match result {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                let _ = reply(&mut self.stream, 1).await;
+                return Err(error);
+            }
+        };
+        reply(&mut self.stream, 0).await?;
+        Ok((self.stream, upstream))
+    }
+}
+
+/// Read the destination before deciding whether it needs MTProto routing.
+async fn negotiate(stream: &mut TcpStream) -> io::Result<(String, u16)> {
     let mut greeting = [0; 2];
     stream.read_exact(&mut greeting).await?;
     if greeting[0] != 5 {
@@ -227,26 +248,28 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<(IpAdd
     // Windows notably — then discards the reply it was about to read.
     let mut request = [0; 4];
     stream.read_exact(&mut request).await?;
-    let host: Option<IpAddr> = match request[3] {
+    let host: Option<String> = match request[3] {
         1 => {
             let mut bytes = [0; 4];
             stream.read_exact(&mut bytes).await?;
-            Some(Ipv4Addr::from(bytes).into())
+            Some(Ipv4Addr::from(bytes).to_string())
         }
         4 => {
             let mut bytes = [0; 16];
             stream.read_exact(&mut bytes).await?;
-            Some(Ipv6Addr::from(bytes).into())
+            Some(Ipv6Addr::from(bytes).to_string())
         }
         3 => {
             let len = usize::from(stream.read_u8().await?);
             let mut bytes = [0; 255];
             stream.read_exact(&mut bytes[..len]).await?;
-            // Accept an IP encoded as DOMAIN, but do not resolve arbitrary
-            // hostnames or mistake FakeIP for a Telegram DC destination.
             std::str::from_utf8(&bytes[..len])
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .filter(|host| {
+                    !host.is_empty()
+                        && !host.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+                })
+                .map(str::to_owned)
         }
         _ => {
             // Its length is unknown, so this one cannot be read to the end.
@@ -254,8 +277,6 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<(IpAdd
             return Err(invalid("unsupported SOCKS address type"));
         }
     };
-    // Only for logs: the bridge reaches the DC over its own routes, so the
-    // port a client asked for never decides where anything connects.
     let port = stream.read_u16().await?;
     if request[0] != 5 || request[2] != 0 {
         reply(stream, 1).await?;
@@ -267,31 +288,9 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<(IpAdd
     }
     let Some(host) = host else {
         reply(stream, 4).await?;
-        return Err(invalid("SOCKS destination must be a mapped Telegram IP"));
+        return Err(invalid("invalid SOCKS destination"));
     };
-    // An IPv4 destination may arrive IPv4-mapped from a dual-stack socket.
-    let ip = host.to_canonical();
-    let dc = destination_dc(ip, config);
-    if dc.is_none() && !is_telegram(ip) {
-        if first_report(ip, ReportKind::NotTelegram) {
-            warn!(
-                "SOCKS destination {}:{} is not a Telegram address; check what the \
-                 router sends here (repeats for this address are logged at debug level)",
-                ip, port
-            );
-        } else {
-            debug!(
-                "SOCKS destination {}:{} is not a Telegram address",
-                ip, port
-            );
-        }
-        reply(stream, 2).await?;
-        return Err(invalid("not a Telegram destination"));
-    }
-    // Telegram sends its transport header only after SOCKS CONNECT succeeds.
-    // The WSS route is selected once that header reveals the framing protocol.
-    reply(stream, 0).await?;
-    Ok((ip, dc))
+    Ok((host, port))
 }
 
 /// The MTProto transport header that follows CONNECT.
@@ -363,8 +362,19 @@ impl Inbound for Socks5 {
         mut stream: TcpStream,
         peer: SocketAddr,
         config: &Config,
-    ) -> Result<Session, Reject> {
-        let (ip, mapped) = negotiate(&mut stream, config)
+    ) -> Result<Accepted, Reject> {
+        let (host, port) = negotiate(&mut stream)
+            .await
+            .map_err(|error| rejected(peer, error))?;
+        let ip = host.parse::<IpAddr>().ok().map(|ip| ip.to_canonical());
+        let mapped = ip.and_then(|ip| destination_dc(ip, config));
+        if mapped.is_none() && !ip.is_some_and(is_telegram) {
+            let host = ip.map_or(host, |ip| ip.to_string());
+            return Ok(Accepted::Tcp(PendingConnect { stream, host, port }));
+        }
+        let ip = ip.expect("Telegram destinations are IP addresses");
+        // Telegram waits for CONNECT before sending its transport header.
+        reply(&mut stream, 0)
             .await
             .map_err(|error| rejected(peer, error))?;
         let transport = read_transport(&mut stream)
@@ -399,13 +409,13 @@ impl Inbound for Socks5 {
             }
         };
         let (reader, writer) = stream.into_split();
-        Ok(Session {
+        Ok(Accepted::Telegram(Session {
             reader: ClientReader::Plain(reader),
             writer: ClientWriter::Plain(writer),
             dc_idx,
             proto: transport.proto,
             obfuscation: transport.obfuscation,
-        })
+        }))
     }
 
     /// A `socks5://` URL for a routing service on this machine, and — unless
